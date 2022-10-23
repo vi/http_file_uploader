@@ -27,14 +27,19 @@ mod flags {
             optional -l,--listen addr : SocketAddr
             /// Optionally remove and bind this UNIX socket for listening incoming connections
             optional -u,--unix path: PathBuf
-            /// Expect file descriptor 0 (or specified) to be pre-connected socket to serve only one connection
+            /// Read from HTTP request from stdin and write HTTP response to stdout
             optional --inetd
-            /// Expect file descriptor 0 (or specified) to be pre-bound listening socket e.g. from systemd
-            optional --accept
-            /// File descriptor to use for --inetd or --accept modes instead of 0.
-            optional --fd fd: u32
+            /// Expect file descriptor 0 (or specified) to be pre-bound listening TCP socket e.g. from systemd's socket activation
+            /// You may want to specify `--fd 3` for systemd
+            optional --accept-tcp
+            /// Expect file descriptor 0 (or specified) to be pre-bound listening UNIX socket e.g. from systemd's socket activation
+            /// You may want to specify `--fd 3` for systemd
+            optional --accept-unix
+            /// File descriptor to use for --inetd or --accept-... modes instead of 0.
+            optional --fd fd: i32
             /// Serve only one successful upload, then exit.
             /// Failed child process executions are not considered as unsuccessful uploads for `--once` purposes, only invalid HTTP requests.
+            /// E.g. trying to write to /dev/full does exit with --once, but failure to open --output file does not.
             optional --once
             /// Dump contents of the file being uploaded to stdout.
             optional -O,--stdout
@@ -72,8 +77,9 @@ mod flags {
         pub listen: Option<SocketAddr>,
         pub unix: Option<PathBuf>,
         pub inetd: bool,
-        pub accept: bool,
-        pub fd: Option<u32>,
+        pub accept_tcp: bool,
+        pub accept_unix: bool,
+        pub fd: Option<i32>,
         pub once: bool,
         pub stdout: bool,
         pub output: Option<PathBuf>,
@@ -121,7 +127,8 @@ mod flags {
             if !has_exactly_one_true([
                 self.listen.is_some() || self.unix.is_some(),
                 self.inetd,
-                self.accept,
+                self.accept_tcp,
+                self.accept_unix
             ]) {
                 eprintln!("Specify exactly one of --listen/--unix, --inetd or --accept");
                 exit(1);
@@ -138,8 +145,8 @@ mod flags {
             }
 
             if self.fd.is_some() {
-                if !self.inetd && !self.accept {
-                    eprintln!("--fd option is meaningless wiouth --inetd or --accept");
+                if !self.inetd && !self.accept_tcp && !self.accept_unix {
+                    eprintln!("--fd option is meaningless without --inetd or --accept");
                     exit(1);
                 }
             }
@@ -166,21 +173,13 @@ mod flags {
                     exit(1);
                 }
             }
+            if self.inetd && self.stdout && self.fd.is_none() {
+                eprintln!("--inetd and --stdout are incompatible, unless --fd is also specified");
+                exit(1);
+            }
 
-            if self.accept {
-                eprintln!("--accept not implemetned");
-                exit(1);
-            }
-            if self.inetd {
-                eprintln!("--inetd not implemetned");
-                exit(1);
-            }
             if self.pipe {
                 eprintln!("--pipe not implemented");
-                exit(1);
-            }
-            if self.output.is_some() {
-                eprintln!("--output not implemented");
                 exit(1);
             }
             if self.program.is_some() {
@@ -270,24 +269,39 @@ async fn handle_upload(
                     continue;
                 }
             }
-            upload_happened = true;
-            if let Some(ref lock) = ban_new_requests_lock {
-                lock.store(true, std::sync::atomic::Ordering::Relaxed);
-                _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
-            }
-            drop(ban_new_requests_lock);
-            if cmd.once {
-                _process_exiter = Some(SendOnDrop(state.shutdown_tx.lock().unwrap().take()));
+
+            macro_rules! official_start_of_the_upload {
+                () => {
+                    upload_happened = true;
+                    if let Some(ref lock) = ban_new_requests_lock {
+                        lock.store(true, std::sync::atomic::Ordering::Relaxed);
+                        _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
+                    }
+                    drop(ban_new_requests_lock);
+                    if cmd.once {
+                        _process_exiter = Some(SendOnDrop(state.shutdown_tx.lock().unwrap().take()));
+                    }
+                };
             }
 
             match sink {
                 CmdSink::Stdout => {
                     let mut so = tokio::io::stdout();
+                    official_start_of_the_upload!();
 
                     while let Some(mut chunk) = field.chunk().await? {
                         so.write_all_buf(&mut chunk).await?;
                     }
                     so.flush().await?;
+                }
+                CmdSink::File(path) => {
+                    let mut f = tokio::fs::File::create(path).await?;
+                    official_start_of_the_upload!();
+                    while let Some(mut chunk) = field.chunk().await? {
+                        f.write_all_buf(&mut chunk).await?;
+                    }
+                    f.flush().await?;
+
                 }
                 _ => unimplemented!(),
             }
@@ -351,11 +365,23 @@ impl hyper::server::accept::Accept for CustomServer {
 
 async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<BoxedSocket>(1);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (mut shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+    let mut tcp_listener = None;
     if let Some(la) = cmd.listen {
+        tcp_listener = Some(tokio::net::TcpListener::bind(la).await?)
+    }
+    #[cfg(unix)]
+    if cmd.accept_tcp {
+        let fd = cmd.fd.unwrap_or(0);
+        use std::os::unix::prelude::FromRawFd;
+        let s = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        s.set_nonblocking(true)?;
+        tcp_listener = Some(tokio::net::TcpListener::from_std(s)?);
+    }
+
+    if let Some(s) = tcp_listener {
         let tx = tx.clone();
-        let s = tokio::net::TcpListener::bind(la).await?;
         tokio::spawn(async move {
             loop {
                 match s.accept().await {
@@ -372,15 +398,30 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
         });
     }
 
+    #[cfg(unix)]
+    let mut unix_listener = None;
+    #[cfg(unix)]
     if let Some(ref path) = cmd.unix {
-        let tx = tx.clone();
         let _ = std::fs::remove_file(path);
-        let s = tokio::net::UnixListener::bind(path)?;
+        unix_listener = Some(tokio::net::UnixListener::bind(path)?);
+    }
+    #[cfg(unix)]
+    if cmd.accept_unix {
+        let fd = cmd.fd.unwrap_or(0);
+        use std::os::unix::prelude::FromRawFd;
+        let s = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        s.set_nonblocking(true)?;
+        unix_listener = Some(tokio::net::UnixListener::from_std(s)?);
+    }
+
+    #[cfg(unix)]
+    if let Some(s) = unix_listener {
+        let tx = tx.clone();
         tokio::spawn(async move {
             loop {
                 match s.accept().await {
-                    Ok((c, ca)) => {
-                        eprintln!("Incoming connection from {:?}", ca);
+                    Ok((c, _ca)) => {
+                        eprintln!("Incoming connection from a UNIX socket");
                         let _ = tx.send(Box::new(c)).await;
                     }
                     Err(e) => {
@@ -392,6 +433,39 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
         });
     }
 
+    macro_rules! plan_shutdown {
+        () => {
+            tokio::spawn(async move {
+                // kludge to avoid premature exit or needless linger after the end of request
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = shutdown_tx.send(());
+            });
+            let (fake_tx,_fake_rx) = tokio::sync::oneshot::channel();
+            shutdown_tx = fake_tx;
+        }
+    }
+
+    #[cfg(unix)]
+    if cmd.inetd && cmd.fd.is_none() {
+        let si = tokio::io::stdin();
+        let so = tokio::io::stdout();
+        let s = readwrite::ReadWriteTokio::new(si, so);
+        tx.try_send(Box::new(s)).unwrap_or_else(|_|panic!("Expected guranteed send to a channel with nonzero buffer"));
+        plan_shutdown!();
+    }
+
+    #[cfg(unix)]
+    if let Some(fd) = cmd.fd {
+        if cmd.inetd {
+            use std::os::unix::prelude::FromRawFd;
+            let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            s.set_nonblocking(true)?;
+            let s = tokio::net::UnixStream::from_std(s)?;
+            tx.try_send(Box::new(s)).unwrap_or_else(|_|panic!("Expected guranteed send to a channel with nonzero buffer"));
+            plan_shutdown!();
+        }
+    }
+
     #[axum_macros::debug_handler]
     async fn handle_upload2(
         Extension(state): Extension<Arc<State>>,
@@ -399,7 +473,7 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
     ) -> (StatusCode, String) {
         match handle_upload(state, multipart).await {
             Ok(x) => x,
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {:#}", e)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {:#}\n", e)),
         }
     }
 
