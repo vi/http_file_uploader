@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::sync::atomic::AtomicBool;
@@ -12,8 +13,9 @@ use axum::Extension;
 use axum::{Router};
 use hyper::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::process::Command;
 
-use crate::flags::CmdSink;
+use crate::flags::{CmdSink, CmdSinkProg};
 
 mod flags {
     use std::path::Path;
@@ -45,7 +47,7 @@ mod flags {
             optional -O,--stdout
             /// Save the file to specified location and overwrite it for each new upload (which may interleave)
             optional -o,--output path: PathBuf
-            /// Execute specified program each time the upload starts, with URL as a sole command line parameter and file content as in stdin
+            /// Execute specified program each time the upload starts, without CLI parameters by default and file content as in stdin
             /// On UNIX, SIGINT is sent to the process if upload is terminated prematurely
             optional -p,--program path: PathBuf
             /// Execute command line (after --) each time the upload starts. URL is not propagated. Uploaded file content is in stdin.
@@ -115,11 +117,15 @@ mod flags {
         iter.into_iter().filter(|x| *x).count() == 1
     }
 
+    pub enum CmdSinkProg<'a> {
+        Program(&'a Path),
+        Cmdline(&'a [OsString]),
+    }
+
     pub enum CmdSink<'a> {
         Stdout,
         File(&'a Path),
-        Program(&'a Path),
-        Cmdline(&'a [OsString]),
+        Prog(CmdSinkProg<'a>),
     }
 
     impl HttpFileUploader {
@@ -182,14 +188,6 @@ mod flags {
                 eprintln!("--pipe not implemented");
                 exit(1);
             }
-            if self.program.is_some() {
-                eprintln!("--program not implemented");
-                exit(1);
-            }
-            if self.cmdline {
-                eprintln!("--cmdline not implemented");
-                exit(1);
-            }
             if self.incomplete_upload_handler.is_some() {
                 eprintln!("incomplete_upload_handler not implemented");
                 exit(1);
@@ -208,10 +206,10 @@ mod flags {
                 return CmdSink::File(path);
             }
             if let Some(ref path) = self.program {
-                return CmdSink::Program(path);
+                return CmdSink::Prog(CmdSinkProg::Program(path));
             }
             if self.cmdline {
-                return CmdSink::Cmdline(&self.argv);
+                return CmdSink::Prog(CmdSinkProg::Cmdline(&self.argv));
             }
             unreachable!()
         }
@@ -272,10 +270,14 @@ async fn handle_upload(
 
             macro_rules! official_start_of_the_upload {
                 () => {
-                    upload_happened = true;
+                    #[allow(unused_assignments)] {
+                        upload_happened = true;
+                    }
                     if let Some(ref lock) = ban_new_requests_lock {
                         lock.store(true, std::sync::atomic::Ordering::Relaxed);
-                        _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
+                        if ! cmd.once {
+                            _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
+                        }
                     }
                     drop(ban_new_requests_lock);
                     if cmd.once {
@@ -303,7 +305,39 @@ async fn handle_upload(
                     f.flush().await?;
 
                 }
-                _ => unimplemented!(),
+                CmdSink::Prog(p) => {
+                    let progname : &OsStr = match p {
+                        CmdSinkProg::Program(p) => p.as_os_str(),
+                        CmdSinkProg::Cmdline(argv) => &argv[0],
+                    };
+                    let mut command = Command::new(progname);
+                    match p {
+                        CmdSinkProg::Program(_) => {
+                            // todo: supply URI as arg
+                        }
+                        CmdSinkProg::Cmdline(argv) => {
+                            command.args(&argv[1..]);
+                        }
+                    }
+                    command.stdin(std::process::Stdio::piped());
+                    command.kill_on_drop(true);
+                    let mut child = command.spawn()?;
+                    let mut stdin = child.stdin.take().expect("Tokio process::Child's stdin is None despite of prior piped call");
+                    official_start_of_the_upload!();
+                    
+                    while let Some(mut chunk) = field.chunk().await? {
+                        stdin.write_all_buf(&mut chunk).await?;
+                    }
+                    stdin.shutdown().await?;
+                    drop(stdin);
+
+                    let code = child.wait().await?;
+                    if code.success() {
+                        return Ok((StatusCode::OK, "Upload successful\n".to_owned()))
+                    } else {
+                        return Ok((StatusCode::INTERNAL_SERVER_ERROR, format!("Process exited with code: {}\n",code)))
+                    }
+                }
             }
 
             break;
@@ -437,6 +471,8 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
         () => {
             tokio::spawn(async move {
                 // kludge to avoid premature exit or needless linger after the end of request
+                // but can't just trigger `shutdown_tx` immediately, as it would cause server to quit before serving the request
+                tokio::task::yield_now().await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let _ = shutdown_tx.send(());
             });
