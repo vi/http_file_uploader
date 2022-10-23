@@ -160,11 +160,9 @@ mod flags {
                 exit(1);
             }
 
-            if self.fd.is_some() {
-                if !self.inetd && !self.accept_tcp && !self.accept_unix {
-                    eprintln!("--fd option is meaningless without --inetd or --accept");
-                    exit(1);
-                }
+            if self.fd.is_some() && !self.inetd && !self.accept_tcp && !self.accept_unix {
+                eprintln!("--fd option is meaningless without --inetd or --accept");
+                exit(1);
             }
 
             if self.cmdline {
@@ -172,11 +170,9 @@ mod flags {
                     eprintln!("Specify positional arguments to use --cmdline mode");
                     exit(1);
                 }
-            } else {
-                if !self.argv.is_empty() {
-                    eprintln!("No positional arguments expected unless --cmdline option is in use");
-                    exit(1);
-                }
+            } else if !self.argv.is_empty() {
+                eprintln!("No positional arguments expected unless --cmdline option is in use");
+                exit(1);
             }
 
             if self.parallelism {
@@ -197,13 +193,9 @@ mod flags {
                 eprintln!("--bufer-child-stdout only works with --program or --cmdline");
                 exit(1);
             }
-            if self.remove_incomplete || self.rename_complete.is_some() {
-                if self.output.is_none() {
-                    eprintln!(
-                        "--remove-incomplete or --rename-complete must be used with --output"
-                    );
-                    exit(1);
-                }
+            if (self.remove_incomplete || self.rename_complete.is_some()) && self.output.is_none() {
+                eprintln!("--remove-incomplete or --rename-complete must be used with --output");
+                exit(1);
             }
             if (self.url || self.url_base64) && self.program.is_none() && !self.cmdline {
                 eprintln!("--url[-base64] only works with --program or --cmdline");
@@ -473,7 +465,10 @@ async fn handle_upload(
                 }
             }
             if !premature_finish {
-                stdin.shutdown().await.context("shutting down child stdin")?;
+                stdin
+                    .shutdown()
+                    .await
+                    .context("shutting down child stdin")?;
             }
             drop(stdin);
 
@@ -484,27 +479,29 @@ async fn handle_upload(
             if let Some(stdout) = stdout_rx {
                 let output = stdout.await.unwrap_or_default();
                 // dirty hack to get text/plain content type easily. UB in theory, works in practice
-                let output = unsafe { String::from_utf8_unchecked(output)};
+                let output = unsafe { String::from_utf8_unchecked(output) };
 
                 if code.success() && !premature_finish {
                     return Ok((StatusCode::OK, output).into_response());
                 } else {
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, output).into_response());
                 }
+            } else if code.success() && !premature_finish {
+                return Ok((StatusCode::OK, "Upload successful\n").into_response());
             } else {
-                if code.success() && !premature_finish {
-                    return Ok((StatusCode::OK, "Upload successful\n").into_response());
-                } else {
-                    return Ok((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "Process exited with code: {}.{}\n",
-                            code,
-                            if premature_finish { " Process exited without fully reading its stdin." } else { "" }
-                        ),
-                    )
-                        .into_response());
-                }
+                return Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Process exited with code: {}.{}\n",
+                        code,
+                        if premature_finish {
+                            " Process exited without fully reading its stdin."
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                    .into_response());
             }
         }
     }
