@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::exit;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -322,11 +323,36 @@ async fn handle_upload(
         CmdSink::File(path) => {
             if let Some(mut field) = chosen_field {
                 let mut f = tokio::fs::File::create(path).await?;
+                let mut remover : Option<RemoveOnDrop> = None;
+
+                struct RemoveOnDrop<'a> { path : &'a Path, defused: bool}
+                impl<'a> Drop for RemoveOnDrop<'a> {
+                    fn drop(&mut self) {
+                        if ! self.defused {
+                            let _ = std::fs::remove_file(self.path);
+                        }
+                    }
+                }
+
+                if cmd.remove_incomplete {
+                    remover = Some(RemoveOnDrop { path, defused: false })
+                }
+
                 official_start_of_the_upload!();
                 while let Some(mut chunk) = field.chunk().await? {
                     f.write_all_buf(&mut chunk).await?;
                 }
                 f.flush().await?;
+                drop(f);
+
+                if let Some(mut rod) = remover {
+                    rod.defused = true;
+                }
+
+                if let Some(ref newpath) = cmd.rename_complete {
+                    tokio::fs::rename(path, newpath).await?;
+                }
+
             }
         }
         CmdSink::Prog(p) => 'skip_prog: {
