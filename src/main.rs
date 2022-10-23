@@ -213,6 +213,22 @@ mod flags {
                 eprintln!("--url and --url-base64 cannot be used together");
                 exit(1);
             }
+
+            #[cfg(not(unix))]
+            if self.unix.is_some() {
+                eprintln!("--unix option is UNIX-only");
+                exit(1);
+            }
+            #[cfg(not(unix))]
+            if self.accept_tcp || self.accept_unix {
+                eprintln!("--accept-* options are UNIX-only");
+                exit(1);
+            }
+            #[cfg(not(unix))]
+            if self.fd.is_some() {
+                eprintln!("--fd option is UNIX-only");
+                exit(1);
+            }
         }
 
         pub fn sink(&self) -> CmdSink<'_> {
