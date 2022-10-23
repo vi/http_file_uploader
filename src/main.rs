@@ -1,20 +1,27 @@
 use std::net::SocketAddr;
-use std::process::{exit};
+use std::process::exit;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{ffi::OsString, path::PathBuf};
 
-use axum::{
-    body::Body,
-    routing::get,
-    Router,
-};
+use axum::extract::Multipart;
+use axum::handler::Handler;
+use axum::Extension;
+use axum::{Router};
+use hyper::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::flags::CmdSink;
+
 mod flags {
+    use std::path::Path;
+
     use super::*;
     xflags::xflags! {
         src "./src/main.rs"
+        /// Special web server to allow shell scripts and other simple UNIX-ey programs to handle multipart/form-data HTTP  file uploads
         cmd HttpFileUploader {
             /// Bind and listen specified TCP socket
             optional -l,--listen addr : SocketAddr
@@ -26,16 +33,33 @@ mod flags {
             optional --accept
             /// File descriptor to use for --inetd or --accept modes instead of 0.
             optional --fd fd: u32
-            /// Serve only one upload
+            /// Serve only one successful upload, then exit.
+            /// Failed child process executions are not considered as unsuccessful uploads for `--once` purposes, only invalid HTTP requests.
             optional --once
-            /// Dump contents of the file being uploaded to stdout. Implies --once
+            /// Dump contents of the file being uploaded to stdout.
             optional -O,--stdout
             /// Save the file to specified location and overwrite it for each new upload (which may interleave)
             optional -o,--output path: PathBuf
             /// Execute specified program each time the upload starts, with URL as a sole command line parameter and file content as in stdin
+            /// On UNIX, SIGINT is sent to the process if upload is terminated prematurely
             optional -p,--program path: PathBuf
             /// Execute command line (after --) each time the upload starts. URL is not propagated. Uploaded file content is in stdin.
+            /// On UNIX, SIGINT is sent to the process if upload is terminated prematurely
             optional -c,--cmdline
+            /// Command line array for --cmdline option
+            repeated argv: OsString
+            /// Restrict multipart field to specified name instead of taking first encountred field.
+            optional -n,--name field_name: String
+            /// Require a file to be uploaded, otherwise failing the request.
+            optional -r,--require-upload
+            /// Pipe output of the executed program as a text/plain reply. HTTP status code gets independent from process exit code
+            optional -P,--pipe
+            /// Start this program in case when upload started, but failed to finish properly e.g. to remove the trimmed file
+            optional --incomplete-upload-handler path: PathBuf
+            /// Start this program after successful upload
+            optional -A,--complete-upload-handler path: PathBuf
+            /// Allow multiple uploads simultaneously
+            optional -L,--parallelism
         }
     }
     // generated start
@@ -43,6 +67,8 @@ mod flags {
     // Run `env UPDATE_XFLAGS=1 cargo build` to regenerate.
     #[derive(Debug)]
     pub struct HttpFileUploader {
+        pub argv: Vec<OsString>,
+
         pub listen: Option<SocketAddr>,
         pub unix: Option<PathBuf>,
         pub inetd: bool,
@@ -53,6 +79,12 @@ mod flags {
         pub output: Option<PathBuf>,
         pub program: Option<PathBuf>,
         pub cmdline: bool,
+        pub name: Option<String>,
+        pub require_upload: bool,
+        pub pipe: bool,
+        pub incomplete_upload_handler: Option<PathBuf>,
+        pub complete_upload_handler: Option<PathBuf>,
+        pub parallelism: bool,
     }
 
     impl HttpFileUploader {
@@ -74,19 +106,33 @@ mod flags {
     // generated end
 
     fn has_exactly_one_true(iter: impl IntoIterator<Item = bool>) -> bool {
-        iter.into_iter().filter(|x|*x).count() == 1
+        iter.into_iter().filter(|x| *x).count() == 1
+    }
+
+    pub enum CmdSink<'a> {
+        Stdout,
+        File(&'a Path),
+        Program(&'a Path),
+        Cmdline(&'a [OsString]),
     }
 
     impl HttpFileUploader {
         pub fn validate_or_exit(&self) {
-            if !has_exactly_one_true([self.listen.is_some() || self.unix.is_some(), self.inetd, self.accept])
-            {
+            if !has_exactly_one_true([
+                self.listen.is_some() || self.unix.is_some(),
+                self.inetd,
+                self.accept,
+            ]) {
                 eprintln!("Specify exactly one of --listen/--unix, --inetd or --accept");
                 exit(1);
             }
 
-            if !has_exactly_one_true([self.stdout, self.output.is_some(), self.program.is_some(), self.cmdline])
-            {
+            if !has_exactly_one_true([
+                self.stdout,
+                self.output.is_some(),
+                self.program.is_some(),
+                self.cmdline,
+            ]) {
                 eprintln!("Specify exactly one of --stdout, --output, --program or --cmdline");
                 exit(1);
             }
@@ -97,15 +143,191 @@ mod flags {
                     exit(1);
                 }
             }
+
+            if self.cmdline {
+                if self.argv.is_empty() {
+                    eprintln!("Specify positional arguments to use --cmdline mode");
+                    exit(1);
+                }
+            } else {
+                if !self.argv.is_empty() {
+                    eprintln!("No positional arguments expected unless --cmdline option is in use");
+                    exit(1);
+                }
+            }
+
+            if self.parallelism {
+                if self.output.is_some() || self.stdout {
+                    eprintln!("--output or --stdout is incompatible with --parallelism");
+                    exit(1);
+                }
+                if self.once {
+                    eprintln!("--output or --stdout is incompatible with --parallelism");
+                    exit(1);
+                }
+            }
+
+            if self.accept {
+                eprintln!("--accept not implemetned");
+                exit(1);
+            }
+            if self.inetd {
+                eprintln!("--inetd not implemetned");
+                exit(1);
+            }
+            if self.pipe {
+                eprintln!("--pipe not implemented");
+                exit(1);
+            }
+            if self.output.is_some() {
+                eprintln!("--output not implemented");
+                exit(1);
+            }
+            if self.program.is_some() {
+                eprintln!("--program not implemented");
+                exit(1);
+            }
+            if self.cmdline {
+                eprintln!("--cmdline not implemented");
+                exit(1);
+            }
+            if self.incomplete_upload_handler.is_some() {
+                eprintln!("incomplete_upload_handler not implemented");
+                exit(1);
+            }
+            if self.complete_upload_handler.is_some() {
+                eprintln!("complete_upload_handler not implemented");
+                exit(1);
+            }
+        }
+
+        pub fn sink(&self) -> CmdSink<'_> {
+            if self.stdout {
+                return CmdSink::Stdout;
+            }
+            if let Some(ref path) = self.output {
+                return CmdSink::File(path);
+            }
+            if let Some(ref path) = self.program {
+                return CmdSink::Program(path);
+            }
+            if self.cmdline {
+                return CmdSink::Cmdline(&self.argv);
+            }
+            unreachable!()
         }
     }
 }
 
 
-trait SocketLike : AsyncRead + AsyncWrite{}
-impl<T:AsyncRead + AsyncWrite> SocketLike for T {}
-type BoxedSocket = Box<dyn SocketLike + Send + Unpin>;
+struct State {
+    cmd: flags::HttpFileUploader,
+    ban_new_requests: tokio::sync::Mutex<Arc<AtomicBool>>,
+    shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
 
+struct SendOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+struct ResetOnDrop(Arc<AtomicBool>);
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn handle_upload(
+    state: Arc<State>,
+    multipart: Option<Multipart>,
+) -> eyre::Result<(StatusCode, String)> {
+    let cmd = &state.cmd;
+    let mut ban_new_requests_lock = None;
+    let mut _unban_new_requests = None;
+    if !cmd.parallelism {
+        let lock = state.ban_new_requests.lock().await;
+        if lock.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Upload is already being served and --parallelism is not specified\n".to_owned(),
+            ));
+        }
+        ban_new_requests_lock = Some(lock);
+    }
+    let sink = cmd.sink();
+
+    let mut upload_happened = false;
+    let mut _process_exiter : Option<SendOnDrop> = None;
+    if let Some(mut multipart) = multipart {
+        while let Some(mut field) = multipart.next_field().await? {
+            let name = field.name();
+            if let Some(ref require_name) = cmd.name {
+                if name != Some(require_name) {
+                    continue;
+                }
+            }
+            upload_happened = true;
+            if let Some(ref lock) = ban_new_requests_lock {
+                lock.store(true, std::sync::atomic::Ordering::Relaxed);
+                _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
+            }
+            drop(ban_new_requests_lock);
+            if cmd.once {
+                _process_exiter = Some(SendOnDrop(state.shutdown_tx.lock().unwrap().take()));
+            }
+
+            match sink {
+                CmdSink::Stdout => {
+                    let mut so = tokio::io::stdout();
+
+                    while let Some(mut chunk) = field.chunk().await? {
+                        so.write_all_buf(&mut chunk).await?;
+                    }
+                    so.flush().await?;
+                }
+                _ => unimplemented!(),
+            }
+
+            break;
+        }
+    }
+    if !upload_happened && cmd.require_upload {
+        if let Some(ref require_name) = cmd.name {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                format!("Multipart form field `{}` is not found\n", require_name),
+            ));
+        } else {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                "No multipart form field found to upload\n".to_owned(),
+            ));
+        }
+    }
+    if upload_happened {
+        Ok((StatusCode::OK, "Upload successful\n".to_owned()))
+    } else {
+        if cmd.program.is_some() || cmd.cmdline {
+            Ok((
+                StatusCode::OK,
+                "No upload happened, but the program was executed\n".to_owned(),
+            ))
+        } else {
+            Ok((
+                StatusCode::BAD_REQUEST,
+                "No upload happened and nothing occurred\n".to_owned(),
+            ))
+        }
+    }
+}
+
+trait SocketLike: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite> SocketLike for T {}
+type BoxedSocket = Box<dyn SocketLike + Send + Unpin>;
 
 #[pin_project::pin_project]
 struct CustomServer(#[pin] tokio::sync::mpsc::Receiver<BoxedSocket>);
@@ -128,11 +350,11 @@ impl hyper::server::accept::Accept for CustomServer {
 }
 
 async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
-    
-
-    let (tx,rx) = tokio::sync::mpsc::channel::<BoxedSocket>(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<BoxedSocket>(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     if let Some(la) = cmd.listen {
+        let tx = tx.clone();
         let s = tokio::net::TcpListener::bind(la).await?;
         tokio::spawn(async move {
             loop {
@@ -150,15 +372,55 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
         });
     }
 
-    async fn plain_text() -> &'static str {
-        "foo"
+    if let Some(ref path) = cmd.unix {
+        let tx = tx.clone();
+        let _ = std::fs::remove_file(path);
+        let s = tokio::net::UnixListener::bind(path)?;
+        tokio::spawn(async move {
+            loop {
+                match s.accept().await {
+                    Ok((c, ca)) => {
+                        eprintln!("Incoming connection from {:?}", ca);
+                        let _ = tx.send(Box::new(c)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("Error accepting from UNIX socket: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
     }
-    let app = Router::new().route("/plain_text", get(plain_text));
+
+    #[axum_macros::debug_handler]
+    async fn handle_upload2(
+        Extension(state): Extension<Arc<State>>,
+        multipart: Option<Multipart>,
+    ) -> (StatusCode, String) {
+        match handle_upload(state, multipart).await {
+            Ok(x) => x,
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {:#}", e)),
+        }
+    }
+
+    let state = Arc::new(State {
+        cmd,
+        ban_new_requests: tokio::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+        shutdown_tx : std::sync::Mutex::new(Some(shutdown_tx)),
+    });
+    let app = Router::new()
+        .fallback(handle_upload2.into_service())
+        .layer(Extension(state));
     let makeservice = app.into_make_service();
 
     let incoming = CustomServer(rx);
 
-    hyper::server::Builder::new(incoming, hyper::server::conn::Http::new()).serve(makeservice).await?;
+    hyper::server::Builder::new(incoming, hyper::server::conn::Http::new())
+        .serve(makeservice)
+        .with_graceful_shutdown(async {
+            shutdown_rx.await.ok();
+        })
+        .await?;
     Ok(())
 }
 
@@ -166,12 +428,11 @@ fn main() -> eyre::Result<()> {
     let cmd = flags::HttpFileUploader::from_env_or_exit();
     cmd.validate_or_exit();
 
-   
-    let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
     rt.block_on(async_main(cmd))?;
 
     Ok(())
 }
-
-
-

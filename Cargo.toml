@@ -8,8 +8,9 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1.0.66", default-features = false, features = ["std"] }
 axum = { version = "0.5.17", default-features = false, features = ["http1", "multipart"] }
-eyre = { version = "0.6.8", default-features = false }
+axum-macros = { version = "0.2.3", default-features = false }
+eyre = { version = "0.6.8", default-features = false, features = ["auto-install"] }
 hyper = { version = "0.14.20", default-features = false, features = ["server"] }
 pin-project = "1.0.12"
 tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util"] }
-xflags = "0.3.0"
+xflags = "0.3.1"
