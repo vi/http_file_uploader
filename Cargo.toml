@@ -2,6 +2,11 @@
 name = "http_file_uploader"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/vi/http_file_uploader"
+categories = ["command-line-utilities","network-programming","web-programming::http-server"]
+keywords = ["upload", "multipart", "file", "cli", "socket"]
+description = "Axum-based HTTP server focused on uploading files using multipart/form-data, saving them to a file, stdout or child process"
+license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,3 +21,13 @@ pin-project = "1.0.12"
 readwrite = { version = "0.2.0", features = ["tokio"] }
 tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process", "macros"] }
 xflags = "0.3.1"
+
+[profile.release]
+opt-level = "s"
+debug = 1
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+incremental = false
+panic = 'unwind'
