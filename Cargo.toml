@@ -6,13 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = { version = "1.0.66", default-features = false, features = ["std"] }
-axum = { version = "0.5.17", default-features = false, features = ["http1", "multipart"] }
+anyhow = "1.0.66"
+axum = { version = "0.5.17", default-features = false, features = ["http1", "multipart", "original-uri"] }
 axum-macros = { version = "0.2.3", default-features = false }
-eyre = { version = "0.6.8", default-features = false, features = ["auto-install"] }
+base64 = "0.13.1"
 hyper = { version = "0.14.20", default-features = false, features = ["server"] }
 libc = "0.2.135"
 pin-project = "1.0.12"
 readwrite = { version = "0.2.0", features = ["tokio"] }
-tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process"] }
+tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process", "macros"] }
 xflags = "0.3.1"

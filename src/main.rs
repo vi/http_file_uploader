@@ -8,14 +8,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{ffi::OsString, path::PathBuf};
 
-use axum::extract::Multipart;
+use anyhow::Context as _;
 use axum::extract::multipart::Field;
+use axum::extract::Multipart;
 use axum::handler::Handler;
+use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use axum::{Router};
+use axum::Router;
 use hyper::StatusCode;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, AsyncReadExt};
-use tokio::process::{Command, Child};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, Command};
 
 use crate::flags::{CmdSink, CmdSinkProg};
 
@@ -64,13 +66,15 @@ mod flags {
             /// Allow multiple uploads simultaneously
             optional -L,--parallelism
             /// Buffer child process output to return it to HTTP client as text/plain
-            optional -B,--bufer-stdout
-            /// Pipe output of the executed program as a text/plain reply. HTTP status code gets independent from process exit code
-            optional -P,--pipe
-            /// Remove --output file if the upload was interrupted 
+            optional -B,--buffer-child-stdout
+            /// Remove --output file if the upload was interrupted
             optional --remove-incomplete
             /// Move --output's file to new path after the upload is fully completed
             optional --rename-complete path: PathBuf
+            /// Append request URL as additional command line parameter
+            optional -U, --url
+            /// Append request URL as additional command line parameter, base64-encoded
+            optional --url-base64
         }
     }
     // generated start
@@ -94,10 +98,11 @@ mod flags {
         pub name: Option<String>,
         pub require_upload: bool,
         pub parallelism: bool,
-        pub bufer_stdout: bool,
-        pub pipe: bool,
+        pub buffer_child_stdout: bool,
         pub remove_incomplete: bool,
         pub rename_complete: Option<PathBuf>,
+        pub url: bool,
+        pub url_base64: bool,
     }
 
     impl HttpFileUploader {
@@ -139,7 +144,7 @@ mod flags {
                 self.listen.is_some() || self.unix.is_some(),
                 self.inetd,
                 self.accept_tcp,
-                self.accept_unix
+                self.accept_unix,
             ]) {
                 eprintln!("Specify exactly one of --listen/--unix, --inetd or --accept");
                 exit(1);
@@ -188,23 +193,24 @@ mod flags {
                 eprintln!("--inetd and --stdout are incompatible, unless --fd is also specified");
                 exit(1);
             }
-            if (self.bufer_stdout || self.pipe) && self.program.is_none() && !self.cmdline {
-                eprintln!("--buffer-stdout or --pipe only works with --program or --cmdline");
-                exit(1);
-            }
-            if self.bufer_stdout && self.pipe {
-                eprintln!("--buffer-stdout and --pipe cannot be used together");
+            if self.buffer_child_stdout && self.program.is_none() && !self.cmdline {
+                eprintln!("--bufer-child-stdout only works with --program or --cmdline");
                 exit(1);
             }
             if self.remove_incomplete || self.rename_complete.is_some() {
                 if self.output.is_none() {
-                    eprintln!("--remove-incomplete or --rename-complete must be used with --output");
+                    eprintln!(
+                        "--remove-incomplete or --rename-complete must be used with --output"
+                    );
                     exit(1);
                 }
             }
-
-            if self.pipe {
-                eprintln!("--pipe not implemented");
+            if (self.url || self.url_base64) && self.program.is_none() && !self.cmdline {
+                eprintln!("--url[-base64] only works with --program or --cmdline");
+                exit(1);
+            }
+            if self.url && self.url_base64 {
+                eprintln!("--url and --url-base64 cannot be used together");
                 exit(1);
             }
         }
@@ -226,7 +232,6 @@ mod flags {
         }
     }
 }
-
 
 struct State {
     cmd: flags::HttpFileUploader,
@@ -252,7 +257,8 @@ impl Drop for ResetOnDrop {
 async fn handle_upload(
     state: Arc<State>,
     mut multipart: Option<Multipart>,
-) -> eyre::Result<(StatusCode, String)> {
+    url: axum::extract::OriginalUri,
+) -> anyhow::Result<Response> {
     let cmd = &state.cmd;
     let mut ban_new_requests_lock = None;
     let mut _unban_new_requests = None;
@@ -261,17 +267,18 @@ async fn handle_upload(
         if lock.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok((
                 StatusCode::TOO_MANY_REQUESTS,
-                "Upload is already being served and --parallelism is not specified\n".to_owned(),
-            ));
+                "Upload is already being served and --parallelism is not specified\n",
+            )
+                .into_response());
         }
         ban_new_requests_lock = Some(lock);
     }
     let sink = cmd.sink();
 
     let mut upload_happened = false;
-    let mut _process_exiter : Option<SendOnDrop> = None;
+    let mut _process_exiter: Option<SendOnDrop> = None;
 
-    let chosen_field : Option<Field> = if let Some(ref mut multipart) = multipart {
+    let chosen_field: Option<Field> = if let Some(ref mut multipart) = multipart {
         loop {
             match multipart.next_field().await? {
                 None => break None,
@@ -282,7 +289,7 @@ async fn handle_upload(
                             continue;
                         }
                     }
-                    break Some(field)
+                    break Some(field);
                 }
             }
         }
@@ -292,12 +299,13 @@ async fn handle_upload(
 
     macro_rules! official_start_of_the_upload {
         () => {
-            #[allow(unused_assignments)] {
+            #[allow(unused_assignments)]
+            {
                 upload_happened = true;
             }
             if let Some(ref lock) = ban_new_requests_lock {
                 lock.store(true, std::sync::atomic::Ordering::Relaxed);
-                if ! cmd.once {
+                if !cmd.once {
                     _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
                 }
             }
@@ -323,19 +331,25 @@ async fn handle_upload(
         CmdSink::File(path) => {
             if let Some(mut field) = chosen_field {
                 let mut f = tokio::fs::File::create(path).await?;
-                let mut remover : Option<RemoveOnDrop> = None;
+                let mut remover: Option<RemoveOnDrop> = None;
 
-                struct RemoveOnDrop<'a> { path : &'a Path, defused: bool}
+                struct RemoveOnDrop<'a> {
+                    path: &'a Path,
+                    defused: bool,
+                }
                 impl<'a> Drop for RemoveOnDrop<'a> {
                     fn drop(&mut self) {
-                        if ! self.defused {
+                        if !self.defused {
                             let _ = std::fs::remove_file(self.path);
                         }
                     }
                 }
 
                 if cmd.remove_incomplete {
-                    remover = Some(RemoveOnDrop { path, defused: false })
+                    remover = Some(RemoveOnDrop {
+                        path,
+                        defused: false,
+                    })
                 }
 
                 official_start_of_the_upload!();
@@ -352,28 +366,31 @@ async fn handle_upload(
                 if let Some(ref newpath) = cmd.rename_complete {
                     tokio::fs::rename(path, newpath).await?;
                 }
-
             }
         }
         CmdSink::Prog(p) => 'skip_prog: {
             if chosen_field.is_none() && cmd.require_upload {
                 break 'skip_prog;
             }
-            let progname : &OsStr = match p {
+            let progname: &OsStr = match p {
                 CmdSinkProg::Program(p) => p.as_os_str(),
                 CmdSinkProg::Cmdline(argv) => &argv[0],
             };
             let mut command = Command::new(progname);
             match p {
-                CmdSinkProg::Program(_) => {
-                    
-                }
+                CmdSinkProg::Program(_) => {}
                 CmdSinkProg::Cmdline(argv) => {
                     command.args(&argv[1..]);
                 }
             }
+            if cmd.url {
+                command.arg(url.0.to_string());
+            }
+            if cmd.url_base64 {
+                command.arg(base64::encode(url.0.to_string()));
+            }
             command.stdin(std::process::Stdio::piped());
-            if cmd.bufer_stdout {
+            if cmd.buffer_child_stdout {
                 command.stdout(std::process::Stdio::piped());
             }
             #[cfg(not(unix))]
@@ -386,19 +403,28 @@ async fn handle_upload(
             impl Drop for ChildWrapper {
                 fn drop(&mut self) {
                     if let Some(id) = self.0.id() {
-                        unsafe { libc::kill(id as libc::pid_t, libc::SIGINT); }
+                        unsafe {
+                            libc::kill(id as libc::pid_t, libc::SIGINT);
+                        }
                     }
                 }
             }
 
             let mut child = ChildWrapper(child);
 
-            let mut stdin = child.0.stdin.take().expect("Tokio process::Child's stdin is None despite of prior piped call");
+            let mut stdin = child
+                .0
+                .stdin
+                .take()
+                .expect("Tokio process::Child's stdin is None despite of prior piped call");
             official_start_of_the_upload!();
 
-            let stdout_rx = if cmd.bufer_stdout {
-                let (tx,rx) = tokio::sync::oneshot::channel();
-                let mut stdout = child.0.stdout.take().expect("Tokio process::Child's stdout is None despite of prior piped call");
+            let stdout_rx = if cmd.buffer_child_stdout {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let mut stdout =
+                    child.0.stdout.take().expect(
+                        "Tokio process::Child's stdout is None despite of prior piped call",
+                    );
                 tokio::spawn(async move {
                     let mut b = Vec::with_capacity(1024);
                     let _ = stdout.read_to_end(&mut b).await;
@@ -409,34 +435,59 @@ async fn handle_upload(
                 None
             };
 
+            let mut premature_finish = false;
             if let Some(mut field) = chosen_field {
-                while let Some(mut chunk) = field.chunk().await? {
-                    stdin.write_all_buf(&mut chunk).await?;
+                loop {
+                    tokio::select!(
+                        ret = field.chunk() => {
+                            if let Some(mut chunk) = ret.context("receiving chunk from field")? {
+                                if stdin.write_all_buf(&mut chunk).await.is_err() {
+                                    premature_finish = true;
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        _exit_code = child.0.wait() => {
+                            premature_finish = true;
+                            break;
+                        }
+                    );
                 }
             }
-            stdin.shutdown().await?;
+            if !premature_finish {
+                stdin.shutdown().await.context("shutting down child stdin")?;
+            }
             drop(stdin);
 
             // todo stdout
 
-            let code = child.0.wait().await?;
+            let code = child.0.wait().await.context("waiting for exit code")?;
 
             if let Some(stdout) = stdout_rx {
                 let output = stdout.await.unwrap_or_default();
-                // kludge to enable binary blobs over String
-                // UB in theory, just transfers the buffer in practice, with wrong Content-Type though
-                let output2 = unsafe { String::from_utf8_unchecked(output) };
+                // dirty hack to get text/plain content type easily. UB in theory, works in practice
+                let output = unsafe { String::from_utf8_unchecked(output)};
 
-                if code.success() {
-                    return Ok((StatusCode::OK, output2))
+                if code.success() && !premature_finish {
+                    return Ok((StatusCode::OK, output).into_response());
                 } else {
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, output2))
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, output).into_response());
                 }
             } else {
-                if code.success() {
-                    return Ok((StatusCode::OK, "Upload successful\n".to_owned()))
+                if code.success() && !premature_finish {
+                    return Ok((StatusCode::OK, "Upload successful\n").into_response());
                 } else {
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, format!("Process exited with code: {}\n",code)))
+                    return Ok((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "Process exited with code: {}.{}\n",
+                            code,
+                            if premature_finish { " Process exited without fully reading its stdin." } else { "" }
+                        ),
+                    )
+                        .into_response());
                 }
             }
         }
@@ -447,21 +498,24 @@ async fn handle_upload(
             return Ok((
                 StatusCode::BAD_REQUEST,
                 format!("Multipart form field `{}` is not found\n", require_name),
-            ));
+            )
+                .into_response());
         } else {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                "No multipart form field found to upload\n".to_owned(),
-            ));
+                "No multipart form field found to upload\n",
+            )
+                .into_response());
         }
     }
     if upload_happened {
-        Ok((StatusCode::OK, "Upload successful\n".to_owned()))
+        Ok((StatusCode::OK, "Upload successful\n").into_response())
     } else {
         Ok((
             StatusCode::BAD_REQUEST,
-            "No upload happened and nothing occurred\n".to_owned(),
-        ))
+            "No upload happened and nothing occurred\n",
+        )
+            .into_response())
     }
 }
 
@@ -475,7 +529,7 @@ struct CustomServer(#[pin] tokio::sync::mpsc::Receiver<BoxedSocket>);
 impl hyper::server::accept::Accept for CustomServer {
     type Conn = BoxedSocket;
 
-    type Error = eyre::Report;
+    type Error = anyhow::Error;
 
     fn poll_accept(
         self: std::pin::Pin<&mut Self>,
@@ -489,7 +543,7 @@ impl hyper::server::accept::Accept for CustomServer {
     }
 }
 
-async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
+async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<BoxedSocket>(1);
     let (mut shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -578,7 +632,8 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
         let si = tokio::io::stdin();
         let so = tokio::io::stdout();
         let s = readwrite::ReadWriteTokio::new(si, so);
-        tx.try_send(Box::new(s)).unwrap_or_else(|_|panic!("Expected guranteed send to a channel with nonzero buffer"));
+        tx.try_send(Box::new(s))
+            .unwrap_or_else(|_| panic!("Expected guranteed send to a channel with nonzero buffer"));
         plan_shutdown!();
     }
 
@@ -589,7 +644,9 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
             let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             s.set_nonblocking(true)?;
             let s = tokio::net::UnixStream::from_std(s)?;
-            tx.try_send(Box::new(s)).unwrap_or_else(|_|panic!("Expected guranteed send to a channel with nonzero buffer"));
+            tx.try_send(Box::new(s)).unwrap_or_else(|_| {
+                panic!("Expected guranteed send to a channel with nonzero buffer")
+            });
             plan_shutdown!();
         }
     }
@@ -598,17 +655,22 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
     async fn handle_upload2(
         Extension(state): Extension<Arc<State>>,
         multipart: Option<Multipart>,
-    ) -> (StatusCode, String) {
-        match handle_upload(state, multipart).await {
+        uri: axum::extract::OriginalUri,
+    ) -> Response {
+        match handle_upload(state, multipart, uri).await {
             Ok(x) => x,
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {:#}\n", e)),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error: {:#}\n", e),
+            )
+                .into_response(),
         }
     }
 
     let state = Arc::new(State {
         cmd,
         ban_new_requests: tokio::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
-        shutdown_tx : std::sync::Mutex::new(Some(shutdown_tx)),
+        shutdown_tx: std::sync::Mutex::new(Some(shutdown_tx)),
     });
     let app = Router::new()
         .fallback(handle_upload2.into_service())
@@ -626,7 +688,7 @@ async fn async_main(cmd: flags::HttpFileUploader) -> eyre::Result<()> {
     Ok(())
 }
 
-fn main() -> eyre::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cmd = flags::HttpFileUploader::from_env_or_exit();
     cmd.validate_or_exit();
 
