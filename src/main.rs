@@ -2,22 +2,25 @@ use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::exit;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::Context as _;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::multipart::Field;
 use axum::extract::Multipart;
 use axum::handler::Handler;
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
+use axum::{Extension, BoxError};
 use axum::Router;
 use hyper::StatusCode;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tower::ServiceBuilder;
+use tower::buffer::BufferLayer;
+use tower::limit::ConcurrencyLimitLayer;
 
 use crate::flags::{CmdSink, CmdSinkProg};
 
@@ -63,8 +66,13 @@ mod flags {
             optional -n,--name field_name: String
             /// Require a file to be uploaded, otherwise failing the request.
             optional -r,--require-upload
-            /// Allow multiple uploads simultaneously
+            /// Allow multiple uploads simultaneously without any limit
             optional -L,--parallelism
+            /// Limit number of upload-serving processes running in parallel.
+            /// You may want to also use -Q option 
+            optional -j,--parallelism-limit limit: usize
+            /// Number of queued waiting requests before starting failing them with 429. Default is 0.
+            optional -Q,--queue len: usize
             /// Buffer child process output to return it to HTTP client as text/plain
             optional -B,--buffer-child-stdout
             /// Remove --output file if the upload was interrupted
@@ -75,6 +83,8 @@ mod flags {
             optional -U, --url
             /// Append request URL as additional command line parameter, base64-encoded
             optional --url-base64
+            /// Do not announce new connections
+            optional -q, --quiet
         }
     }
     // generated start
@@ -98,11 +108,14 @@ mod flags {
         pub name: Option<String>,
         pub require_upload: bool,
         pub parallelism: bool,
+        pub parallelism_limit: Option<usize>,
+        pub queue: Option<usize>,
         pub buffer_child_stdout: bool,
         pub remove_incomplete: bool,
         pub rename_complete: Option<PathBuf>,
         pub url: bool,
         pub url_base64: bool,
+        pub quiet: bool,
     }
 
     impl HttpFileUploader {
@@ -175,13 +188,13 @@ mod flags {
                 exit(1);
             }
 
-            if self.parallelism {
+            if self.parallelism || self.parallelism_limit.is_some() {
                 if self.output.is_some() || self.stdout {
-                    eprintln!("--output or --stdout is incompatible with --parallelism");
+                    eprintln!("--output or --stdout is incompatible with --parallelism/-j");
                     exit(1);
                 }
                 if self.once {
-                    eprintln!("--output or --stdout is incompatible with --parallelism");
+                    eprintln!("--once is not compatible with --parallelism/-j");
                     exit(1);
                 }
             }
@@ -205,6 +218,31 @@ mod flags {
                 eprintln!("--url and --url-base64 cannot be used together");
                 exit(1);
             }
+            if let Some(q) = self.queue {
+                if self.once {
+                    eprintln!("--queue is not compatible with --once");
+                    exit(1);
+                }
+                if q == 0 {
+                    eprintln!("--queue=0 does not work");
+                    exit(1);
+                }
+            }
+            if let Some(p) = self.parallelism_limit { 
+                if  self.parallelism {
+                    eprintln!("--parallelism-limit is meaningless with with --parallelism (unrestricted parallelism)");
+                    exit(1);
+                }
+                if p == 0 {
+                    eprintln!("-j 0 does not work");
+                    exit(1);
+                }
+            }
+            if self.parallelism && self.queue.is_some() {
+                eprintln!("--queue is meaningless with unrestricted --parallelism");
+                exit(1);
+            }
+
 
             #[cfg(not(unix))]
             if self.unix.is_some() {
@@ -243,7 +281,6 @@ mod flags {
 
 struct State {
     cmd: flags::HttpFileUploader,
-    ban_new_requests: tokio::sync::Mutex<Arc<AtomicBool>>,
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -255,12 +292,6 @@ impl Drop for SendOnDrop {
         }
     }
 }
-struct ResetOnDrop(Arc<AtomicBool>);
-impl Drop for ResetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-}
 
 async fn handle_upload(
     state: Arc<State>,
@@ -268,19 +299,6 @@ async fn handle_upload(
     url: axum::extract::OriginalUri,
 ) -> anyhow::Result<Response> {
     let cmd = &state.cmd;
-    let mut ban_new_requests_lock = None;
-    let mut _unban_new_requests = None;
-    if !cmd.parallelism {
-        let lock = state.ban_new_requests.lock().await;
-        if lock.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                "Upload is already being served and --parallelism is not specified\n",
-            )
-                .into_response());
-        }
-        ban_new_requests_lock = Some(lock);
-    }
     let sink = cmd.sink();
 
     let mut upload_happened = false;
@@ -311,13 +329,6 @@ async fn handle_upload(
             {
                 upload_happened = true;
             }
-            if let Some(ref lock) = ban_new_requests_lock {
-                lock.store(true, std::sync::atomic::Ordering::Relaxed);
-                if !cmd.once {
-                    _unban_new_requests = Some(ResetOnDrop(Arc::clone(lock)));
-                }
-            }
-            drop(ban_new_requests_lock);
             if cmd.once {
                 _process_exiter = Some(SendOnDrop(state.shutdown_tx.lock().unwrap().take()));
             }
@@ -579,7 +590,9 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
             loop {
                 match s.accept().await {
                     Ok((c, ca)) => {
-                        eprintln!("Incoming connection from {}", ca);
+                        if !cmd.quiet {
+                            eprintln!("Incoming connection from {}", ca);
+                        }
                         let _ = tx.send(Box::new(c)).await;
                     }
                     Err(e) => {
@@ -614,7 +627,9 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
             loop {
                 match s.accept().await {
                     Ok((c, _ca)) => {
-                        eprintln!("Incoming connection from a UNIX socket");
+                        if !cmd.quiet {
+                            eprintln!("Incoming connection from a UNIX socket");
+                        }
                         let _ = tx.send(Box::new(c)).await;
                     }
                     Err(e) => {
@@ -680,14 +695,27 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
         }
     }
 
+    let concurrencly_limit = if cmd.parallelism {
+        None
+    } else {
+        Some(cmd.parallelism_limit.unwrap_or(1))
+    };
+    let queue = cmd.queue;
+
     let state = Arc::new(State {
         cmd,
-        ban_new_requests: tokio::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
         shutdown_tx: std::sync::Mutex::new(Some(shutdown_tx)),
     });
     let app = Router::new()
         .fallback(handle_upload2.into_service())
-        .layer(Extension(state));
+        .layer(Extension(state))
+        .layer(ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(my_error_handler))
+            .load_shed()
+            .option_layer(queue.map(|x|BufferLayer::new(x)))
+            .option_layer(concurrencly_limit.map(|x|ConcurrencyLimitLayer::new(x)))
+        );
+
     let makeservice = app.into_make_service();
 
     let incoming = CustomServer(rx);
@@ -699,6 +727,19 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+async fn my_error_handler(err: BoxError) -> (StatusCode, String) {
+    if err.is::<tower::load_shed::error::Overloaded>() {
+     (   StatusCode::TOO_MANY_REQUESTS,
+        "Request is already being served and --parallelism is not specified (or -j limit is exceed) and no -Q is present or the queue is full".to_owned()
+    )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unhandled internal error: {}", err),
+        )
+    }  
 }
 
 fn main() -> anyhow::Result<()> {

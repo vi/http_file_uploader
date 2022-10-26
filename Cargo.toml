@@ -1,6 +1,6 @@
 [package]
 name = "http_file_uploader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/vi/http_file_uploader"
 categories = ["command-line-utilities","network-programming","web-programming::http-server"]
@@ -20,6 +20,7 @@ libc = "0.2.135"
 pin-project = "1.0.12"
 readwrite = { version = "0.2.0", features = ["tokio"] }
 tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process", "macros"] }
+tower = { version = "0.4.13", features = ["limit", "buffer", "load-shed", "util"] }
 xflags = "0.3.1"
 
 [profile.release]
