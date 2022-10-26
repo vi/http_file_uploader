@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::exit;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -8,19 +9,22 @@ use std::time::Duration;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::Context as _;
+use axum::body::Bytes;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::multipart::Field;
-use axum::extract::Multipart;
+use axum::extract::{Multipart, RequestParts};
 use axum::handler::Handler;
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, BoxError};
 use axum::Router;
-use hyper::StatusCode;
+use axum::{BoxError, Extension};
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use hyper::header::CONTENT_TYPE;
+use hyper::{Body, Request, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tower::ServiceBuilder;
 use tower::buffer::BufferLayer;
 use tower::limit::ConcurrencyLimitLayer;
+use tower::ServiceBuilder;
 
 use crate::flags::{CmdSink, CmdSinkProg};
 
@@ -69,9 +73,10 @@ mod flags {
             /// Allow multiple uploads simultaneously without any limit
             optional -L,--parallelism
             /// Limit number of upload-serving processes running in parallel.
-            /// You may want to also use -Q option 
+            /// You may want to also use -Q option
             optional -j,--parallelism-limit limit: usize
-            /// Number of queued waiting requests before starting failing them with 429. Default is 0.
+            /// Number of queued waiting requests before starting failing them with 429. Default is no queue.
+            /// Note that single TCP connection can issue multiple requests in parallel, filling up the queue.
             optional -Q,--queue len: usize
             /// Buffer child process output to return it to HTTP client as text/plain
             optional -B,--buffer-child-stdout
@@ -85,6 +90,10 @@ mod flags {
             optional --url-base64
             /// Do not announce new connections
             optional -q, --quiet
+            /// Allow plain, non-multipart/form-data requests (and stream body chunks instead of form field's chunks)
+            optional -P,--allow-nonmultipart
+            /// Don't try to decode multipart/form-data content, just stream request body as is always.
+            optional --no-multipart
         }
     }
     // generated start
@@ -116,6 +125,8 @@ mod flags {
         pub url: bool,
         pub url_base64: bool,
         pub quiet: bool,
+        pub allow_nonmultipart: bool,
+        pub no_multipart: bool,
     }
 
     impl HttpFileUploader {
@@ -228,8 +239,8 @@ mod flags {
                     exit(1);
                 }
             }
-            if let Some(p) = self.parallelism_limit { 
-                if  self.parallelism {
+            if let Some(p) = self.parallelism_limit {
+                if self.parallelism {
                     eprintln!("--parallelism-limit is meaningless with with --parallelism (unrestricted parallelism)");
                     exit(1);
                 }
@@ -242,7 +253,16 @@ mod flags {
                 eprintln!("--queue is meaningless with unrestricted --parallelism");
                 exit(1);
             }
-
+            if self.no_multipart {
+                if !self.allow_nonmultipart {
+                    eprintln!("--no-multipart is meaningless without --allow-nonmultipart");
+                    exit(1);
+                }
+                if self.require_upload || self.name.is_some() {
+                    eprintln!("--require-upload or --name are incompatible with --no-multipart");
+                    exit(1);
+                }
+            }
 
             #[cfg(not(unix))]
             if self.unix.is_some() {
@@ -295,8 +315,8 @@ impl Drop for SendOnDrop {
 
 async fn handle_upload(
     state: Arc<State>,
-    mut multipart: Option<Multipart>,
     url: axum::extract::OriginalUri,
+    rq: Request<Body>,
 ) -> anyhow::Result<Response> {
     let cmd = &state.cmd;
     let sink = cmd.sink();
@@ -304,7 +324,31 @@ async fn handle_upload(
     let mut upload_happened = false;
     let mut _process_exiter: Option<SendOnDrop> = None;
 
-    let chosen_field: Option<Field> = if let Some(ref mut multipart) = multipart {
+    let mut parts = RequestParts::new(rq);
+    let multipart: Multipart;
+    let mut multipart = if cmd.no_multipart {
+        None
+    } else {
+        if let Some(ct) = parts.headers().get(CONTENT_TYPE) {
+            let ct = ct.as_bytes();
+            if ct
+                .split_at(19.min(ct.len()))
+                .0
+                .eq_ignore_ascii_case(b"multipart/form-data")
+            {
+                multipart = parts.extract().await?;
+                Some(multipart)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    type ChunksStream<'a> = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + 'a>>;
+
+    let chosen_field: Option<Field<'_>> = if let Some(ref mut multipart) = multipart {
         loop {
             match multipart.next_field().await? {
                 None => break None,
@@ -323,6 +367,24 @@ async fn handle_upload(
         None
     };
 
+    let chosen_stream: Option<ChunksStream> = if let Some(field) = chosen_field {
+        Some(
+            field
+                .map_err(|x| anyhow::anyhow!("multipart error: {}", x))
+                .boxed(),
+        )
+    } else {
+        if cmd.allow_nonmultipart {
+            if let Some(b) = parts.take_body() {
+                Some(b.map_err(|x| x.into()).boxed())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     macro_rules! official_start_of_the_upload {
         () => {
             #[allow(unused_assignments)]
@@ -337,18 +399,19 @@ async fn handle_upload(
 
     match sink {
         CmdSink::Stdout => {
-            if let Some(mut field) = chosen_field {
+            if let Some(mut field) = chosen_stream {
                 let mut so = tokio::io::stdout();
                 official_start_of_the_upload!();
 
-                while let Some(mut chunk) = field.chunk().await? {
+                while let Some(chunk) = field.next().await {
+                    let mut chunk = chunk?;
                     so.write_all_buf(&mut chunk).await?;
                 }
                 so.flush().await?;
             }
         }
         CmdSink::File(path) => {
-            if let Some(mut field) = chosen_field {
+            if let Some(mut stream) = chosen_stream {
                 let mut f = tokio::fs::File::create(path).await?;
                 let mut remover: Option<RemoveOnDrop> = None;
 
@@ -372,7 +435,8 @@ async fn handle_upload(
                 }
 
                 official_start_of_the_upload!();
-                while let Some(mut chunk) = field.chunk().await? {
+                while let Some(chunk) = stream.next().await {
+                    let mut chunk = chunk?;
                     f.write_all_buf(&mut chunk).await?;
                 }
                 f.flush().await?;
@@ -388,7 +452,7 @@ async fn handle_upload(
             }
         }
         CmdSink::Prog(p) => 'skip_prog: {
-            if chosen_field.is_none() && cmd.require_upload {
+            if chosen_stream.is_none() && cmd.require_upload {
                 break 'skip_prog;
             }
             let progname: &OsStr = match p {
@@ -455,11 +519,12 @@ async fn handle_upload(
             };
 
             let mut premature_finish = false;
-            if let Some(mut field) = chosen_field {
+            if let Some(mut stream) = chosen_stream {
                 loop {
                     tokio::select!(
-                        ret = field.chunk() => {
-                            if let Some(mut chunk) = ret.context("receiving chunk from field")? {
+                        ret = stream.next() => {
+                            if let Some(chunk) = ret {
+                                let mut chunk = chunk?;
                                 if stdin.write_all_buf(&mut chunk).await.is_err() {
                                     premature_finish = true;
                                     break;
@@ -482,8 +547,6 @@ async fn handle_upload(
                     .context("shutting down child stdin")?;
             }
             drop(stdin);
-
-            // todo stdout
 
             let code = child.0.wait().await.context("waiting for exit code")?;
 
@@ -682,10 +745,10 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
     #[axum_macros::debug_handler]
     async fn handle_upload2(
         Extension(state): Extension<Arc<State>>,
-        multipart: Option<Multipart>,
         uri: axum::extract::OriginalUri,
+        rq: Request<Body>,
     ) -> Response {
-        match handle_upload(state, multipart, uri).await {
+        match handle_upload(state, uri, rq).await {
             Ok(x) => x,
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -709,11 +772,12 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
     let app = Router::new()
         .fallback(handle_upload2.into_service())
         .layer(Extension(state))
-        .layer(ServiceBuilder::new()
-            .layer(HandleErrorLayer::new(my_error_handler))
-            .load_shed()
-            .option_layer(queue.map(|x|BufferLayer::new(x)))
-            .option_layer(concurrencly_limit.map(|x|ConcurrencyLimitLayer::new(x)))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(my_error_handler))
+                .load_shed()
+                .option_layer(queue.map(|x| BufferLayer::new(x)))
+                .option_layer(concurrencly_limit.map(|x| ConcurrencyLimitLayer::new(x))),
         );
 
     let makeservice = app.into_make_service();
@@ -731,7 +795,7 @@ async fn async_main(cmd: flags::HttpFileUploader) -> anyhow::Result<()> {
 
 async fn my_error_handler(err: BoxError) -> (StatusCode, String) {
     if err.is::<tower::load_shed::error::Overloaded>() {
-     (   StatusCode::TOO_MANY_REQUESTS,
+        (   StatusCode::TOO_MANY_REQUESTS,
         "Request is already being served and --parallelism is not specified (or -j limit is exceed) and no -Q is present or the queue is full".to_owned()
     )
     } else {
@@ -739,7 +803,7 @@ async fn my_error_handler(err: BoxError) -> (StatusCode, String) {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Unhandled internal error: {}", err),
         )
-    }  
+    }
 }
 
 fn main() -> anyhow::Result<()> {
