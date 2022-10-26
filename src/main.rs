@@ -35,7 +35,7 @@ mod flags {
     xflags::xflags! {
         src "./src/main.rs"
         /// Special web server to allow shell scripts and other simple UNIX-ey programs to handle multipart/form-data HTTP  file uploads
-        cmd HttpFileUploader {
+        cmd http-file-uploader {
             /// Bind and listen specified TCP socket
             optional -l,--listen addr : SocketAddr
             /// Optionally remove and bind this UNIX socket for listening incoming connections

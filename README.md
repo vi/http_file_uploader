@@ -8,6 +8,7 @@ HTTP listening features:
 * Listening for connections on UNIX path
 * Using stdin/stdout to serve one connection, inetd-style
 * Accepting connections from a pre-bound TCP or UNIX socket e.g. from SystemD socket activation service
+* Decoding multipart request bodies, selecting specific field from it (or optionally just streaming the whole request body). Or just simply starting programs on each request (even without body).
 
 Sink features:
 
@@ -43,7 +44,7 @@ $ cmp myupload.txt Cargo.toml
 # CLI usage message
 
 ```
-HttpFileUploader
+http-file-uploader
   Special web server to allow shell scripts and other simple UNIX-ey programs to handle multipart/form-data HTTP  file uploads
 
 ARGS:
@@ -97,7 +98,15 @@ OPTIONS:
       Require a file to be uploaded, otherwise failing the request.
 
     -L, --parallelism
-      Allow multiple uploads simultaneously
+      Allow multiple uploads simultaneously without any limit
+
+    -j, --parallelism-limit <limit>
+      Limit number of upload-serving processes running in parallel.
+      You may want to also use -Q option
+
+    -Q, --queue <len>
+      Number of queued waiting requests before starting failing them with 429. Default is no queue.
+      Note that single TCP connection can issue multiple requests in parallel, filling up the queue.
 
     -B, --buffer-child-stdout
       Buffer child process output to return it to HTTP client as text/plain
@@ -113,6 +122,18 @@ OPTIONS:
 
     --url-base64
       Append request URL as additional command line parameter, base64-encoded
+
+    -q, --quiet
+      Do not announce new connections
+
+    -P, --allow-nonmultipart
+      Allow plain, non-multipart/form-data requests (and stream body chunks instead of form field's chunks)
+
+    --no-multipart
+      Don't try to decode multipart/form-data content, just stream request body as is always.
+
+    -M, --method
+      Append HTTP request method to the command line parameters (before --url if specified)
 
     -h, --help
       Prints help information.
