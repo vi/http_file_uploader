@@ -94,6 +94,8 @@ mod flags {
             optional -P,--allow-nonmultipart
             /// Don't try to decode multipart/form-data content, just stream request body as is always.
             optional --no-multipart
+            /// Append HTTP request method to the command line parameters (before --url if specified)
+            optional -M,--method
         }
     }
     // generated start
@@ -127,6 +129,7 @@ mod flags {
         pub quiet: bool,
         pub allow_nonmultipart: bool,
         pub no_multipart: bool,
+        pub method: bool,
     }
 
     impl HttpFileUploader {
@@ -221,8 +224,8 @@ mod flags {
                 eprintln!("--remove-incomplete or --rename-complete must be used with --output");
                 exit(1);
             }
-            if (self.url || self.url_base64) && self.program.is_none() && !self.cmdline {
-                eprintln!("--url[-base64] only works with --program or --cmdline");
+            if (self.url || self.url_base64 || self.method) && self.program.is_none() && !self.cmdline {
+                eprintln!("--url[-base64] or --method only works with --program or --cmdline");
                 exit(1);
             }
             if self.url && self.url_base64 {
@@ -325,6 +328,7 @@ async fn handle_upload(
     let mut _process_exiter: Option<SendOnDrop> = None;
 
     let mut parts = RequestParts::new(rq);
+    let method = parts.method().clone();
     let multipart: Multipart;
     let mut multipart = if cmd.no_multipart {
         None
@@ -465,6 +469,9 @@ async fn handle_upload(
                 CmdSinkProg::Cmdline(argv) => {
                     command.args(&argv[1..]);
                 }
+            }
+            if cmd.method {
+                command.arg(method.to_string());
             }
             if cmd.url {
                 command.arg(url.0.to_string());
