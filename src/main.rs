@@ -11,7 +11,7 @@ use std::{ffi::OsString, path::PathBuf};
 use anyhow::Context as _;
 use axum::body::Bytes;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::{RequestParts};
+use axum::extract::RequestParts;
 use axum::handler::Handler;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -19,7 +19,7 @@ use axum::{BoxError, Extension};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Body, Request, StatusCode};
-use multer::{Multipart, Field};
+use multer::{Field, Multipart};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tower::buffer::BufferLayer;
@@ -80,6 +80,9 @@ mod flags {
             optional -Q,--queue len: usize
             /// Buffer child process output to return it to HTTP client as text/plain
             optional -B,--buffer-child-stdout
+            /// Don't bother calculating Content-Length, instead pipe child process's stdout to HTTP reply chunk by chunk
+            /// HTTP response status code would not depend on successfull child process exit code in this mode
+            optional -I, --pipe
             /// Remove --output file if the upload was interrupted
             optional --remove-incomplete
             /// Move --output's file to new path after the upload is fully completed
@@ -122,6 +125,7 @@ mod flags {
         pub parallelism_limit: Option<usize>,
         pub queue: Option<usize>,
         pub buffer_child_stdout: bool,
+        pub pipe: bool,
         pub remove_incomplete: bool,
         pub rename_complete: Option<PathBuf>,
         pub url: bool,
@@ -216,15 +220,22 @@ mod flags {
                 eprintln!("--inetd and --stdout are incompatible, unless --fd is also specified");
                 exit(1);
             }
-            if self.buffer_child_stdout && self.program.is_none() && !self.cmdline {
-                eprintln!("--bufer-child-stdout only works with --program or --cmdline");
+            if (self.buffer_child_stdout || self.pipe) && self.program.is_none() && !self.cmdline {
+                eprintln!("--bufer-child-stdout or --pipe only works with --program or --cmdline");
+                exit(1);
+            }
+            if self.buffer_child_stdout && self.pipe {
+                eprintln!("--bufer-child-stdout and --pipe cannot be used together");
                 exit(1);
             }
             if (self.remove_incomplete || self.rename_complete.is_some()) && self.output.is_none() {
                 eprintln!("--remove-incomplete or --rename-complete must be used with --output");
                 exit(1);
             }
-            if (self.url || self.url_base64 || self.method) && self.program.is_none() && !self.cmdline {
+            if (self.url || self.url_base64 || self.method)
+                && self.program.is_none()
+                && !self.cmdline
+            {
                 eprintln!("--url[-base64] or --method only works with --program or --cmdline");
                 exit(1);
             }
@@ -330,31 +341,41 @@ async fn handle_upload(
     let mut parts = RequestParts::new(rq);
     let method = parts.method().clone();
 
-    let mut multipart : Option<Multipart<'static>> = if cmd.no_multipart {
+    let mut multipart: Option<Multipart<'static>> = if cmd.no_multipart {
         None
     } else {
         if let Some(ct) = parts.headers().get(CONTENT_TYPE) {
             match multer::parse_boundary(ct.to_str()?) {
-                Ok(boundary) => { 
+                Ok(boundary) => {
                     if let Some(b) = parts.take_body() {
                         Some(Multipart::new(b, boundary))
                     } else {
                         if cmd.require_upload && !cmd.allow_nonmultipart {
-                            return Ok((StatusCode::BAD_REQUEST, "No body in the incoming upload request\n").into_response());
+                            return Ok((
+                                StatusCode::BAD_REQUEST,
+                                "No body in the incoming upload request\n",
+                            )
+                                .into_response());
                         }
                         None
                     }
                 }
                 Err(e) => {
                     if cmd.require_upload && !cmd.allow_nonmultipart {
-                        return Ok((StatusCode::BAD_REQUEST, format!("Failed to parse multipart Content-Type: {}\n", e)).into_response());
+                        return Ok((
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to parse multipart Content-Type: {}\n", e),
+                        )
+                            .into_response());
                     }
                     None
                 }
             }
         } else {
             if cmd.require_upload && !cmd.allow_nonmultipart {
-                return Ok((StatusCode::BAD_REQUEST, "Content-Type header is required\n").into_response());
+                return Ok(
+                    (StatusCode::BAD_REQUEST, "Content-Type header is required\n").into_response(),
+                );
             }
             None
         }
@@ -490,7 +511,7 @@ async fn handle_upload(
                 command.arg(base64::encode(url.0.to_string()));
             }
             command.stdin(std::process::Stdio::piped());
-            if cmd.buffer_child_stdout {
+            if cmd.buffer_child_stdout || cmd.pipe {
                 command.stdout(std::process::Stdio::piped());
             }
             #[cfg(not(unix))]
@@ -519,7 +540,7 @@ async fn handle_upload(
                 .expect("Tokio process::Child's stdin is None despite of prior piped call");
             official_start_of_the_upload!();
 
-            let stdout_rx = if cmd.buffer_child_stdout {
+            let stdout_rx_buffered = if cmd.buffer_child_stdout {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let mut stdout =
                     child.0.stdout.take().expect(
@@ -535,39 +556,94 @@ async fn handle_upload(
                 None
             };
 
-            let mut premature_finish = false;
-            if let Some(mut stream) = chosen_stream {
-                loop {
-                    tokio::select!(
-                        ret = stream.next() => {
-                            if let Some(chunk) = ret {
-                                let mut chunk = chunk?;
-                                if stdin.write_all_buf(&mut chunk).await.is_err() {
+            let stdout_rx_piped = if cmd.pipe {
+                let stdout =
+                    child.0.stdout.take().expect(
+                        "Tokio process::Child's stdout is None despite of prior piped call",
+                    );
+                let stream = tokio_util::io::ReaderStream::new(stdout);
+                Some(axum::body::StreamBody::new(stream))
+            } else {
+                None
+            };
+
+            let (code, premature_finish) = if !cmd.pipe {
+                let mut premature_finish = false;
+                if let Some(mut stream) = chosen_stream {
+                    loop {
+                        tokio::select!(
+                            ret = stream.next() => {
+                                if let Some(chunk) = ret {
+                                    let mut chunk = chunk?;
+                                    if stdin.write_all_buf(&mut chunk).await.is_err() {
+                                        premature_finish = true;
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            _exit_code = child.0.wait() => {
+                                premature_finish = true;
+                                break;
+                            }
+                        );
+                    }
+                }
+                if !premature_finish {
+                    stdin
+                        .shutdown()
+                        .await
+                        .context("shutting down child stdin")?;
+                }
+                drop(stdin);
+
+                let code = child.0.wait().await.context("waiting for exit code")?;
+                (code, premature_finish)
+            } else {
+                // pipe mode
+                tokio::spawn(async move {
+                    let mut premature_finish = false;
+                    if let Some(mut stream) = chosen_stream {
+                        loop {
+                            tokio::select!(
+                                ret = stream.next() => {
+                                    if let Some(chunk) = ret {
+                                        let mut chunk = match chunk {
+                                            Ok(x) => x,
+                                            Err(_) => { premature_finish = true; break; }
+                                        };
+                                        if stdin.write_all_buf(&mut chunk).await.is_err() {
+                                            premature_finish = true;
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                _exit_code = child.0.wait() => {
                                     premature_finish = true;
                                     break;
                                 }
-                            } else {
-                                break;
-                            }
+                            );
                         }
-                        _exit_code = child.0.wait() => {
-                            premature_finish = true;
-                            break;
-                        }
-                    );
-                }
-            }
-            if !premature_finish {
-                stdin
-                    .shutdown()
-                    .await
-                    .context("shutting down child stdin")?;
-            }
-            drop(stdin);
+                    }
+                    if !premature_finish {
+                        let _ = stdin.shutdown().await;
+                    }
+                    drop(stdin);
+                    if premature_finish {
+                        drop(child)
+                    } else {
+                        let _ = child.0.wait().await;
+                    }
+                });
 
-            let code = child.0.wait().await.context("waiting for exit code")?;
+                let body = stdout_rx_piped.unwrap();
+                return Ok(body.into_response());
+            };
 
-            if let Some(stdout) = stdout_rx {
+            if let Some(stdout) = stdout_rx_buffered {
                 let output = stdout.await.unwrap_or_default();
                 // dirty hack to get text/plain content type easily. UB in theory, works in practice
                 let output = unsafe { String::from_utf8_unchecked(output) };

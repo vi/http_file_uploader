@@ -216,6 +216,7 @@ dependencies = [
  "axum",
  "axum-macros",
  "base64",
+ "bytes",
  "futures-util",
  "hyper",
  "libc",
@@ -223,6 +224,7 @@ dependencies = [
  "pin-project",
  "readwrite",
  "tokio",
+ "tokio-util",
  "tower",
  "xflags",
 ]

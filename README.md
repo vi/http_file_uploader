@@ -39,6 +39,20 @@ $ httpfileuploader  -l 127.0.0.1:8080 -o myupload.txt.tmp --rename-complete myup
 Incoming connection from 127.0.0.1:48712      | $ curl http://127.0.0.1:8080 --form f=@Cargo.toml
                                               | Upload successful
 $ cmp myupload.txt Cargo.toml
+
+$ http_file_uploader -l 127.0.0.1:1234 -r -P -I --cmdline -- stdbuf -oL /bin/rev&
+$ nc 127.0.0.1 1234
+POST / HTTP/1.0
+Content-Length: 1000
+
+HTTP/1.0 200 OK
+date: Thu, 27 Oct 2022 13:26:14 GMT
+
+Hello, world
+dlrow ,olleH
+12345
+54321
+^C
 ```
 
 # CLI usage message
@@ -110,6 +124,9 @@ OPTIONS:
 
     -B, --buffer-child-stdout
       Buffer child process output to return it to HTTP client as text/plain
+
+    -I, --pipe
+      Don't bother calculating Content-Length, instead pipe child process's stdout to HTTP reply chunk by chunk
 
     --remove-incomplete
       Remove --output file if the upload was interrupted

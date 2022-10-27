@@ -15,6 +15,7 @@ anyhow = "1.0.66"
 axum = { version = "0.5.17", default-features = false, features = ["http1", "multipart", "original-uri"] }
 axum-macros = { version = "0.2.3", default-features = false }
 base64 = "0.13.1"
+bytes = "1.2.1"
 futures-util = "0.3.25"
 hyper = { version = "0.14.20", default-features = false, features = ["server"] }
 libc = "0.2.135"
@@ -22,6 +23,7 @@ multer = "2.0.4"
 pin-project = "1.0.12"
 readwrite = { version = "0.2.0", features = ["tokio"] }
 tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process", "macros"] }
+tokio-util = { version = "0.7.4", features = ["io"] }
 tower = { version = "0.4.13", features = ["limit", "buffer", "load-shed", "util"] }
 xflags = "0.3.1"
 
