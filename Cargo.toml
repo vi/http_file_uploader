@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.66"
-axum = { version = "0.5.17", default-features = false, features = ["http1", "multipart", "original-uri"] }
+axum = { version = "0.5.17", default-features = false, features = ["http1", "http2", "multipart", "original-uri"] }
 axum-macros = { version = "0.2.3", default-features = false }
 base64 = "0.13.1"
 bytes = "1.2.1"
