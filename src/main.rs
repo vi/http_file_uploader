@@ -11,8 +11,7 @@ use std::{ffi::OsString, path::PathBuf};
 use anyhow::Context as _;
 use axum::body::Bytes;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::multipart::Field;
-use axum::extract::{Multipart, RequestParts};
+use axum::extract::{RequestParts};
 use axum::handler::Handler;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -20,6 +19,7 @@ use axum::{BoxError, Extension};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Body, Request, StatusCode};
+use multer::{Multipart, Field};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tower::buffer::BufferLayer;
@@ -329,30 +329,40 @@ async fn handle_upload(
 
     let mut parts = RequestParts::new(rq);
     let method = parts.method().clone();
-    let multipart: Multipart;
-    let mut multipart = if cmd.no_multipart {
+
+    let mut multipart : Option<Multipart<'static>> = if cmd.no_multipart {
         None
     } else {
         if let Some(ct) = parts.headers().get(CONTENT_TYPE) {
-            let ct = ct.as_bytes();
-            if ct
-                .split_at(19.min(ct.len()))
-                .0
-                .eq_ignore_ascii_case(b"multipart/form-data")
-            {
-                multipart = parts.extract().await?;
-                Some(multipart)
-            } else {
-                None
+            match multer::parse_boundary(ct.to_str()?) {
+                Ok(boundary) => { 
+                    if let Some(b) = parts.take_body() {
+                        Some(Multipart::new(b, boundary))
+                    } else {
+                        if cmd.require_upload && !cmd.allow_nonmultipart {
+                            return Ok((StatusCode::BAD_REQUEST, "No body in the incoming upload request\n").into_response());
+                        }
+                        None
+                    }
+                }
+                Err(e) => {
+                    if cmd.require_upload && !cmd.allow_nonmultipart {
+                        return Ok((StatusCode::BAD_REQUEST, format!("Failed to parse multipart Content-Type: {}\n", e)).into_response());
+                    }
+                    None
+                }
             }
         } else {
+            if cmd.require_upload && !cmd.allow_nonmultipart {
+                return Ok((StatusCode::BAD_REQUEST, "Content-Type header is required\n").into_response());
+            }
             None
         }
     };
 
-    type ChunksStream<'a> = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + 'a>>;
+    type ChunksStream = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + 'static>>;
 
-    let chosen_field: Option<Field<'_>> = if let Some(ref mut multipart) = multipart {
+    let chosen_field: Option<Field<'static>> = if let Some(ref mut multipart) = multipart {
         loop {
             match multipart.next_field().await? {
                 None => break None,

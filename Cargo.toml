@@ -18,6 +18,7 @@ base64 = "0.13.1"
 futures-util = "0.3.25"
 hyper = { version = "0.14.20", default-features = false, features = ["server"] }
 libc = "0.2.135"
+multer = "2.0.4"
 pin-project = "1.0.12"
 readwrite = { version = "0.2.0", features = ["tokio"] }
 tokio = { version = "1.21.2", features = ["rt", "net", "sync", "io-util", "fs", "process", "macros"] }
